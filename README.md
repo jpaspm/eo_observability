@@ -31,7 +31,7 @@ enterprise-observability-platform/
 
 | Domain | Tools | Collector | OTel Signal |
 |---|---|---|---|
-| Infrastructure | Cloud Insights, VictoriaMetrics | Telegraf + OTel | Metrics, Logs |
+| Infrastructure | Grafana, VictoriaMetrics | Telegraf + OTel | Metrics, Logs |
 | Applications | AppDynamics, Dynatrace, New Relic | OTel Collector | Traces, Metrics, Logs |
 | Network | ThousandEyes, Logic Monitor, Selector | Prometheus Exporter + OTel | Metrics, Flows |
 | Events | Moogsoft, Splunk ITSI | Vector + OTel | Logs (Events) |

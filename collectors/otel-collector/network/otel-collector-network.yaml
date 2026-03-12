@@ -1,0 +1,227 @@
+# =============================================================================
+# OpenTelemetry Collector — Network Domain
+# Enterprise Observability Platform
+#
+# Receives : Prometheus metrics from ThousandEyes / Logic Monitor exporters
+#            SNMP via snmpreceiver
+#            sFlow / NetFlow via network telemetry
+# Processes: Flow normalization, topology enrichment, OTel semantic mapping
+# Exports  : OTLP → Kafka (net.metrics / net.flows / net.topology)
+#            OTLP → Databricks S3
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+  memory_ballast:
+    size_mib: 512
+
+receivers:
+  # ── OTLP (from network tools supporting OTLP natively) ───────────────────
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+      http:
+        endpoint: "0.0.0.0:4318"
+
+  # ── ThousandEyes exporter (Prometheus format) ─────────────────────────────
+  prometheus/thousandeyes:
+    config:
+      scrape_configs:
+        - job_name: "thousandeyes"
+          scrape_interval: 60s
+          static_configs:
+            - targets: ["${THOUSANDEYES_EXPORTER_HOST}:9090"]
+          metric_relabel_configs:
+            # Map ThousandEyes metrics → OTel network semantic conventions
+            - source_labels: [__name__]
+              regex: "thousandeyes_http_response_time"
+              target_label: __name__
+              replacement: "network.http.response_time"
+            - source_labels: [__name__]
+              regex: "thousandeyes_path_trace_latency"
+              target_label: __name__
+              replacement: "network.path.latency"
+            - source_labels: [__name__]
+              regex: "thousandeyes_loss"
+              target_label: __name__
+              replacement: "network.packet.loss_rate"
+            - source_labels: [__name__]
+              regex: "thousandeyes_jitter"
+              target_label: __name__
+              replacement: "network.jitter"
+            - source_labels: [test_name]
+              target_label: "network.test.name"
+            - source_labels: [agent_name]
+              target_label: "network.agent.name"
+            - regex: "test_name|agent_name"
+              action: labeldrop
+
+  # ── Logic Monitor Prometheus exporter ─────────────────────────────────────
+  prometheus/logicmonitor:
+    config:
+      scrape_configs:
+        - job_name: "logicmonitor"
+          scrape_interval: 60s
+          static_configs:
+            - targets: ["${LOGICMONITOR_EXPORTER_HOST}:9091"]
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: "lm_device_cpu"
+              target_label: __name__
+              replacement: "system.cpu.utilization"
+            - source_labels: [__name__]
+              regex: "lm_device_memory"
+              target_label: __name__
+              replacement: "system.memory.utilization"
+            - source_labels: [__name__]
+              regex: "lm_interface_bandwidth"
+              target_label: __name__
+              replacement: "network.interface.bandwidth"
+            - source_labels: [device_name]
+              target_label: "net.device.name"
+            - source_labels: [device_ip]
+              target_label: "net.device.ip"
+
+  # ── SNMP receiver (directly poll network devices) ─────────────────────────
+  snmp:
+    collection_interval: 60s
+    encodings:
+      - community: "${SNMP_COMMUNITY}"
+        version:   v2c
+    targets:
+      - endpoint:  "udp://${CORE_SWITCH_IP}:161"
+        name:      "core-switch-01"
+      - endpoint:  "udp://${EDGE_ROUTER_IP}:161"
+        name:      "edge-router-01"
+    attributes:
+      ifAlias:
+        oid:    "1.3.6.1.2.1.31.1.1.1.18"
+        name:   "network.interface.alias"
+        type:   string
+      ifSpeed:
+        oid:    "1.3.6.1.2.1.2.2.1.5"
+        name:   "network.interface.speed"
+        type:   gauge
+    metrics:
+      ifInOctets:
+        oid:    "1.3.6.1.2.1.2.2.1.10"
+        name:   "network.interface.receive.bytes"
+        type:   counter
+      ifOutOctets:
+        oid:    "1.3.6.1.2.1.2.2.1.16"
+        name:   "network.interface.transmit.bytes"
+        type:   counter
+      ifInErrors:
+        oid:    "1.3.6.1.2.1.2.2.1.14"
+        name:   "network.interface.errors.receive"
+        type:   counter
+      ifOutErrors:
+        oid:    "1.3.6.1.2.1.2.2.1.20"
+        name:   "network.interface.errors.transmit"
+        type:   counter
+      ifOperStatus:
+        oid:    "1.3.6.1.2.1.2.2.1.8"
+        name:   "network.interface.status"
+        type:   gauge
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib:      1024
+    spike_limit_mib: 256
+
+  batch:
+    send_batch_size: 1000
+    timeout:         10s
+
+  resourcedetection:
+    detectors: [env, system]
+    timeout:   5s
+
+  # ── Network domain resource enrichment ───────────────────────────────────
+  resource:
+    attributes:
+      - key:   "service.namespace"
+        value: "network"
+        action: upsert
+      - key:   "eop.domain"
+        value: "network"
+        action: upsert
+      - key:   "telemetry.sdk.name"
+        value: "opentelemetry"
+        action: upsert
+
+  # ── Normalize network attribute naming ───────────────────────────────────
+  attributes:
+    actions:
+      # SNMP interface index → OTel
+      - key:   "ifIndex"
+        action: delete
+      - key:   "network.interface.index"
+        from_attribute: "ifIndex"
+        action: insert
+      # Selector AI → OTel
+      - key:   "selector_node"
+        action: delete
+      - key:   "net.device.name"
+        from_attribute: "selector_node"
+        action: insert
+
+  # ── DQ: drop metrics without device identifier ───────────────────────────
+  filter:
+    error_mode: ignore
+    metrics:
+      datapoint:
+        - 'resource.attributes["net.device.name"] == nil and resource.attributes["host.name"] == nil'
+        - 'resource.attributes["deployment.environment"] == nil'
+
+exporters:
+  kafka/metrics:
+    brokers:          ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    protocol_version: "2.6.0"
+    topic:            "net.metrics"
+    encoding:         otlp_proto
+    producer:
+      compression: zstd
+
+  kafka/flows:
+    brokers:          ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    protocol_version: "2.6.0"
+    topic:            "net.flows"
+    encoding:         otlp_proto
+    producer:
+      compression: zstd
+
+  awss3:
+    s3_uploader:
+      region:     "${AWS_REGION}"
+      s3_bucket:  "${S3_LANDING_BUCKET}"
+      s3_prefix:  "otel/network/"
+      s3_partition_format: "{year}/{month}/{day}/{hour}/"
+      file_format: parquet
+      compression: snappy
+    marshaler: otlp_proto
+
+  # ── Selector AI (passthrough + enrichment) ────────────────────────────────
+  otlp/selector:
+    endpoint: "${SELECTOR_AI_ENDPOINT}"
+    headers:
+      "Authorization": "Bearer ${SELECTOR_AI_TOKEN}"
+
+service:
+  extensions: [health_check, memory_ballast]
+
+  pipelines:
+    metrics:
+      receivers:  [otlp, prometheus/thousandeyes, prometheus/logicmonitor, snmp]
+      processors: [memory_limiter, resourcedetection, resource, attributes, filter, batch]
+      exporters:  [kafka/metrics, awss3, otlp/selector]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level:   normal
+      address: "0.0.0.0:8888"

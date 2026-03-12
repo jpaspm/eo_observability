@@ -1,0 +1,324 @@
+# =============================================================================
+# Vector Configuration — Events & Alerts Domain
+# Enterprise Observability Platform
+#
+# Purpose : Normalize events from Moogsoft, Splunk ITSI, and alert feeds
+#           into OTel LogRecord format and forward to Kafka topics.
+#
+# Domains handled : Events (Moogsoft, Splunk ITSI)
+#                   Alerting (ServiceNow, Grafana AlertManager)
+# =============================================================================
+
+# ── Data directory (disk buffer) ─────────────────────────────────────────────
+data_dir: "/var/lib/vector"
+
+# =============================================================================
+# SOURCES
+# =============================================================================
+
+sources:
+
+  # ── Moogsoft webhook receiver ─────────────────────────────────────────────
+  moogsoft_events:
+    type: http_server
+    address: "0.0.0.0:8080"
+    path: "/moogsoft/events"
+    method: POST
+    encoding:
+      codec: json
+    tls:
+      enabled: true
+      cert_file: /etc/vector/certs/server.crt
+      key_file:  /etc/vector/certs/server.key
+
+  # ── Splunk ITSI notable event feed (HTTP Event Collector) ─────────────────
+  splunk_itsi_events:
+    type: splunk_hec
+    address: "0.0.0.0:8088"
+    valid_tokens:
+      - "${SPLUNK_HEC_TOKEN}"
+
+  # ── Grafana AlertManager webhook ─────────────────────────────────────────
+  grafana_alerts:
+    type: http_server
+    address: "0.0.0.0:8081"
+    path: "/grafana/alerts"
+    method: POST
+    encoding:
+      codec: json
+
+  # ── ServiceNow event feed (polled via REST API) ───────────────────────────
+  servicenow_events:
+    type: http_client
+    endpoint: "${SERVICENOW_INSTANCE}/api/now/table/em_event?sysparm_limit=100&sysparm_query=state=open"
+    method: GET
+    scrape_interval_secs: 60
+    auth:
+      strategy: basic
+      user:     "${SERVICENOW_USER}"
+      password: "${SERVICENOW_PASSWORD}"
+    decoding:
+      codec: json
+
+  # ── Kafka (consume from upstream topics for cross-domain events) ──────────
+  kafka_infra_alerts:
+    type: kafka
+    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
+    topics:
+      - "infra.metrics.alerts"
+    group_id: "vector-event-consumer"
+    auto_offset_reset: latest
+    key_field: "alert_id"
+    decoding:
+      codec: json
+
+# =============================================================================
+# TRANSFORMS — Normalize to OTel LogRecord format
+# =============================================================================
+
+transforms:
+
+  # ── Moogsoft → OTel LogRecord ─────────────────────────────────────────────
+  normalize_moogsoft:
+    type: remap
+    inputs: [moogsoft_events]
+    source: |
+      # OTel Resource attributes
+      .resource = {}
+      .resource."service.name"           = .source_id   ?? "moogsoft"
+      .resource."service.namespace"      = "events"
+      .resource."host.name"              = .node        ?? "unknown"
+      .resource."deployment.environment" = get_env_var("DEPLOYMENT_ENV") ?? "prod"
+      .resource."eop.domain"             = "events"
+      .resource."eop.source_tool"        = "moogsoft"
+
+      # OTel LogRecord fields
+      .timestamp_unix_nano = to_unix_timestamp(
+          parse_timestamp(.time ?? now(), format: "%+") ?? now(),
+          unit: "nanoseconds"
+      )
+
+      # OTel severity mapping from Moogsoft severity (1-5 scale)
+      .severity_number, .severity_text = if .severity == 1 {
+          9, "INFO"
+      } else if .severity == 2 {
+          13, "WARN"
+      } else if .severity == 3 {
+          17, "ERROR"
+      } else if .severity == 4 {
+          21, "FATAL"
+      } else if .severity == 5 {
+          24, "FATAL4"
+      } else {
+          9, "INFO"
+      }
+
+      # OTel log body
+      .body = .description ?? .message ?? "Moogsoft event"
+
+      # OTel standard attributes
+      .attributes = {}
+      .attributes."event.name"              = .signature       ?? ""
+      .attributes."event.domain"            = "moogsoft"
+      .attributes."event.source"            = .source_id       ?? ""
+      .attributes."event.class"             = .type            ?? ""
+      .attributes."event.correlation_id"    = .moomsoftId      ?? to_string(.id ?? "")
+      .attributes."event.status"            = .state           ?? ""
+      .attributes."event.priority"          = to_string(.priority ?? "")
+      .attributes."net.host.name"           = .node            ?? ""
+      .attributes."net.host.ip"             = .external_id     ?? ""
+      .attributes."eop.fingerprint"         = sha2(.body + .resource."host.name", variant: "SHA-256")
+
+      # Clean up original fields
+      del(.source_id, .node, .severity, .time, .description, .message,
+          .signature, .type, .moomsoftId, .id, .state, .priority, .external_id)
+
+  # ── Splunk ITSI → OTel LogRecord ─────────────────────────────────────────
+  normalize_splunk_itsi:
+    type: remap
+    inputs: [splunk_itsi_events]
+    source: |
+      .resource = {}
+      .resource."service.name"           = .source       ?? "splunk-itsi"
+      .resource."service.namespace"      = "events"
+      .resource."host.name"              = .host         ?? "unknown"
+      .resource."deployment.environment" = get_env_var("DEPLOYMENT_ENV") ?? "prod"
+      .resource."eop.domain"             = "events"
+      .resource."eop.source_tool"        = "splunk-itsi"
+
+      .timestamp_unix_nano = to_unix_timestamp(
+          from_unix_timestamp(to_int(.time ?? 0), unit: "seconds"),
+          unit: "nanoseconds"
+      )
+
+      # Splunk severity: 0=info,1=activity,2=warn,3=error,4=critical
+      .severity_number, .severity_text = if .severity == 0 {
+          9, "INFO"
+      } else if .severity == 1 {
+          9, "INFO"
+      } else if .severity == 2 {
+          13, "WARN"
+      } else if .severity == 3 {
+          17, "ERROR"
+      } else if .severity == 4 {
+          21, "FATAL"
+      } else {
+          9, "INFO"
+      }
+
+      .body = .event ?? ""
+
+      .attributes = {}
+      .attributes."event.name"           = .name          ?? ""
+      .attributes."event.domain"         = "splunk-itsi"
+      .attributes."event.source"         = .source        ?? ""
+      .attributes."event.source_type"    = .sourcetype    ?? ""
+      .attributes."event.index"          = .index         ?? ""
+      .attributes."splunk.search_name"   = .search_name   ?? ""
+      .attributes."eop.fingerprint"      = sha2(.body + .resource."host.name", variant: "SHA-256")
+
+      del(.event, .source, .sourcetype, .index, .search_name, .host, .time, .severity, .name)
+
+  # ── Grafana AlertManager → OTel LogRecord ────────────────────────────────
+  normalize_grafana_alerts:
+    type: remap
+    inputs: [grafana_alerts]
+    source: |
+      # AlertManager sends an array of alerts; flatten
+      alerts = .alerts ?? []
+
+      # Process each alert (we'll fan-out via route if needed)
+      . = map_values(alerts) -> |alert| {
+          resource = {}
+          resource."service.name"           = alert.labels.alertname    ?? "grafana-alert"
+          resource."service.namespace"      = "alerting"
+          resource."host.name"              = alert.labels.instance     ?? "unknown"
+          resource."deployment.environment" = alert.labels.env          ?? get_env_var("DEPLOYMENT_ENV") ?? "prod"
+          resource."eop.domain"             = "alerting"
+          resource."eop.source_tool"        = "grafana-alertmanager"
+
+          timestamp_unix_nano = to_unix_timestamp(
+              parse_timestamp(alert.startsAt ?? now(), format: "%+") ?? now(),
+              unit: "nanoseconds"
+          )
+
+          severity_number, severity_text = if alert.status == "firing" {
+              to_int(alert.labels.severity_number ?? 17), upcase(alert.labels.severity ?? "ERROR")
+          } else {
+              9, "INFO"
+          }
+
+          body = alert.annotations.description ?? alert.annotations.summary ?? alert.labels.alertname ?? "Alert"
+
+          attributes = {}
+          attributes."alert.name"         = alert.labels.alertname  ?? ""
+          attributes."alert.status"       = alert.status            ?? ""
+          attributes."alert.fingerprint"  = alert.fingerprint       ?? ""
+          attributes."alert.namespace"    = alert.labels.namespace  ?? ""
+          attributes."alert.severity"     = alert.labels.severity   ?? ""
+          attributes."alert.source_url"   = alert.generatorURL      ?? ""
+          attributes."alert.runbook_url"  = alert.annotations.runbook_url ?? ""
+          attributes."eop.fingerprint"    = alert.fingerprint       ?? sha2(body, variant: "SHA-256")
+
+          {
+              "resource": resource,
+              "timestamp_unix_nano": timestamp_unix_nano,
+              "severity_number": severity_number,
+              "severity_text": severity_text,
+              "body": body,
+              "attributes": attributes
+          }
+      }
+
+  # ── Merge all normalized events ───────────────────────────────────────────
+  merge_events:
+    type: merge
+    inputs:
+      - normalize_moogsoft
+      - normalize_splunk_itsi
+      - normalize_grafana_alerts
+      - servicenow_events
+
+  # ── Deduplicate by fingerprint ────────────────────────────────────────────
+  deduplicate:
+    type: dedupe
+    inputs: [merge_events]
+    fields:
+      match:
+        - ".attributes.eop\\.fingerprint"
+    cache:
+      num_events: 50000
+
+  # ── Route: high-severity to dedicated topic ───────────────────────────────
+  route_by_severity:
+    type: route
+    inputs: [deduplicate]
+    route:
+      high_severity: ".severity_number >= 17"
+      normal:        ".severity_number < 17"
+
+# =============================================================================
+# SINKS (Outputs)
+# =============================================================================
+
+sinks:
+
+  # ── Kafka: events.raw ─────────────────────────────────────────────────────
+  kafka_events_raw:
+    type: kafka
+    inputs: [route_by_severity.normal]
+    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
+    topic: "events.raw"
+    encoding:
+      codec: json
+    compression: zstd
+    batch:
+      max_bytes: 5242880
+      timeout_secs: 5
+    buffer:
+      type: disk
+      max_size: 268435456                                # 256MB disk buffer
+      when_full: block
+    tls:
+      enabled: true
+      ca_file: /etc/vector/certs/kafka-ca.crt
+
+  # ── Kafka: events.critical (high-severity fast-path) ─────────────────────
+  kafka_events_critical:
+    type: kafka
+    inputs: [route_by_severity.high_severity]
+    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
+    topic: "events.critical"
+    encoding:
+      codec: json
+    compression: zstd
+
+  # ── Kafka: alerts.raw ─────────────────────────────────────────────────────
+  kafka_alerts_raw:
+    type: kafka
+    inputs: [normalize_grafana_alerts]
+    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
+    topic: "alerts.raw"
+    encoding:
+      codec: json
+    compression: zstd
+
+  # ── S3 (Databricks landing zone) ─────────────────────────────────────────
+  s3_events:
+    type: aws_s3
+    inputs: [deduplicate]
+    bucket: "${S3_LANDING_BUCKET}"
+    region: "${AWS_REGION}"
+    key_prefix: "otel/events/%Y/%m/%d/%H/"
+    compression: gzip
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 52428800                                # 50MB
+      timeout_secs: 300
+
+  # ── Internal metrics (O³ monitoring) ─────────────────────────────────────
+  internal_metrics:
+    type: prometheus_exporter
+    inputs: [internal_metrics]
+    address: "0.0.0.0:9598"

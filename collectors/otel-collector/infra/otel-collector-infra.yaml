@@ -1,0 +1,324 @@
+# =============================================================================
+# OpenTelemetry Collector — Infrastructure Domain
+# Enterprise Observability Platform
+#
+# Receives : OTLP/gRPC from Telegraf agents, VictoriaMetrics remote-write
+# Processes: Schema normalization, DQ validation, attribute enrichment
+# Exports  : OTLP → Kafka (infra.metrics / infra.logs)
+#            OTLP → ClickHouse (hot store)
+#            OTLP → Databricks S3 landing zone
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+  pprof:
+    endpoint: "0.0.0.0:1777"
+  memory_ballast:
+    size_mib: 512
+  zpages:
+    endpoint: "0.0.0.0:55679"
+
+receivers:
+  # ── OTLP from Telegraf agents ─────────────────────────────────────────────
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+        tls:
+          ca_file:   /etc/otel/certs/ca.crt
+          cert_file: /etc/otel/certs/collector.crt
+          key_file:  /etc/otel/certs/collector.key
+        max_recv_msg_size_mib: 64
+        keepalive:
+          server_parameters:
+            max_connection_age: 30s
+            max_connection_age_grace: 10s
+      http:
+        endpoint: "0.0.0.0:4318"                       # OTLP/HTTP fallback
+
+  # ── Prometheus scrape (for services not using Telegraf) ───────────────────
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "infra-node-exporter"
+          scrape_interval: 60s
+          scrape_timeout:  10s
+          static_configs:
+            - targets: ["${NODE_EXPORTER_TARGETS}"]
+          metric_relabel_configs:
+            # Rename node_exporter metrics → OTel system.* names
+            - source_labels: [__name__]
+              regex: "node_cpu_seconds_total"
+              target_label: __name__
+              replacement: "system.cpu.time"
+            - source_labels: [__name__]
+              regex: "node_memory_MemUsed_bytes"
+              target_label: __name__
+              replacement: "system.memory.usage"
+            - source_labels: [__name__]
+              regex: "node_filesystem_avail_bytes"
+              target_label: __name__
+              replacement: "system.filesystem.available"
+            - source_labels: [__name__]
+              regex: "node_network_receive_bytes_total"
+              target_label: __name__
+              replacement: "system.network.io"
+
+  # ── Filelog receiver for infra logs ───────────────────────────────────────
+  filelog:
+    include:
+      - /var/log/infra/*.log
+      - /var/log/cloud-insights/*.log
+    start_at: end
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.time
+          layout: "%Y-%m-%dT%H:%M:%S.%LZ"
+      - type: severity_parser
+        parse_from: attributes.level
+        mapping:
+          fatal:  ["FATAL", "CRITICAL", "EMERG"]
+          error:  ["ERROR", "ERR"]
+          warn:   ["WARN", "WARNING"]
+          info:   ["INFO"]
+          debug:  ["DEBUG", "TRACE"]
+      - type: resource_detection
+        detectors: [env, system]
+
+  # ── Host metrics (fallback direct collection) ─────────────────────────────
+  hostmetrics:
+    collection_interval: 60s
+    root_path: /hostfs
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+          system.cpu.logical.count:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk:
+        metrics:
+          system.disk.io:
+            enabled: true
+          system.disk.operations:
+            enabled: true
+      filesystem:
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
+        include_fs_types:
+          match_type: strict
+          fs_types: ["ext4", "xfs", "ntfs", "apfs"]
+      network:
+        metrics:
+          system.network.io:
+            enabled: true
+          system.network.connections:
+            enabled: true
+      processes:
+      load:
+
+processors:
+  # ── Memory limiter (must be first) ────────────────────────────────────────
+  memory_limiter:
+    check_interval: 5s
+    limit_mib:      1536
+    spike_limit_mib: 512
+
+  # ── Batch for efficiency ──────────────────────────────────────────────────
+  batch:
+    send_batch_size:     1000
+    send_batch_max_size: 2000
+    timeout:             10s
+
+  # ── Resource detection — auto-populate host.*, cloud.* attributes ─────────
+  resourcedetection:
+    detectors:       [env, system, docker, ec2, ecs, eks, gce, gke, azure]
+    timeout:         5s
+    override:        false
+    system:
+      hostname_sources: ["os"]
+    ec2:
+      tags:          ["^kubernetes.*", "^Name$", "^Environment$", "^Team$"]
+
+  # ── Resource attribute enrichment (OTel semantic conventions) ────────────
+  resource:
+    attributes:
+      # Mandatory EOP standard attributes
+      - key: "service.namespace"
+        value: "infrastructure"
+        action: upsert
+      - key: "telemetry.sdk.name"
+        value: "opentelemetry"
+        action: upsert
+      - key: "eop.domain"
+        value: "infrastructure"
+        action: upsert
+      - key: "eop.version"
+        value: "1.0.0"
+        action: upsert
+      # Ensure environment is set
+      - key: "deployment.environment"
+        from_attribute: DEPLOYMENT_ENV
+        action: insert
+      # Cost tagging
+      - key: "finops.cost_center"
+        from_attribute: COST_CENTER
+        action: insert
+
+  # ── Attribute normalization (field-level OTel naming) ─────────────────────
+  attributes:
+    actions:
+      # Normalize CPU mode tag to OTel standard
+      - key:     "cpu"
+        action:  delete                                    # remove raw telegraf tag
+      - key:     "system.cpu.logical_number"
+        from_attribute: "cpu"
+        action:  insert
+      # Normalize interface tag
+      - key:     "interface"
+        action:  delete
+      - key:     "network.interface.name"
+        from_attribute: "interface"
+        action:  insert
+      # Normalize mount point
+      - key:     "path"
+        action:  delete
+      - key:     "system.filesystem.mountpoint"
+        from_attribute: "path"
+        action:  insert
+
+  # ── Data Quality filter — drop records missing mandatory attributes ────────
+  filter:
+    error_mode: ignore
+    metrics:
+      datapoint:
+        # Drop if service.name is missing (DQ rule: completeness)
+        - 'resource.attributes["service.name"] == nil'
+        # Drop if host.name is missing
+        - 'resource.attributes["host.name"] == nil'
+        # Drop future-timestamped metrics (DQ rule: timeliness)
+        - 'UnixNano(Now()) - UnixNano(start_time) < -300000000000'   # >5min future
+
+  # ── Tail sampling for traces ───────────────────────────────────────────────
+  tail_sampling:
+    decision_wait: 30s
+    policies:
+      - name: errors-policy
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: slow-traces
+        type: latency
+        latency: {threshold_ms: 1000}
+      - name: random-sample-10pct
+        type: probabilistic
+        probabilistic: {sampling_percentage: 10}
+
+  # ── Transform — compute derived metrics ──────────────────────────────────
+  transform:
+    metric_statements:
+      - context: datapoint
+        statements:
+          # Add utilization percentage as derived metric
+          - set(attributes["unit"], "1") where metric.name == "system.cpu.utilization"
+          - set(attributes["unit"], "By") where IsMatch(metric.name, "system.memory.*")
+
+exporters:
+  # ── Primary: Kafka (domain-namespaced topics) ─────────────────────────────
+  kafka:
+    brokers:         ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    protocol_version: "2.6.0"
+    encoding:        otlp_proto
+    topic:           "infra.metrics"                     # metrics topic
+    auth:
+      tls:
+        ca_file:   /etc/otel/certs/kafka-ca.crt
+        cert_file: /etc/otel/certs/kafka-client.crt
+        key_file:  /etc/otel/certs/kafka-client.key
+    producer:
+      max_message_bytes: 1000000
+      compression:       zstd
+      flush_max_messages: 1000
+
+  # ── ClickHouse (hot store — operational queries) ──────────────────────────
+  clickhouse:
+    endpoint:        "${CLICKHOUSE_ENDPOINT}"
+    database:        "otel_infra"
+    username:        "${CLICKHOUSE_USER}"
+    password:        "${CLICKHOUSE_PASSWORD}"
+    ttl:             336h                                 # 14 days hot TTL
+    compress:        lz4
+    create_schema:   true
+    logs_table_name:    "otel_logs_infra"
+    metrics_table_name: "otel_metrics_infra"
+    traces_table_name:  "otel_traces_infra"
+    timeout:         10s
+    retry_on_failure:
+      enabled:       true
+      initial_interval: 5s
+      max_interval:   30s
+      max_elapsed_time: 300s
+
+  # ── S3 (Databricks Auto Loader landing zone) ──────────────────────────────
+  awss3:
+    s3_uploader:
+      region:       "${AWS_REGION}"
+      s3_bucket:    "${S3_LANDING_BUCKET}"
+      s3_prefix:    "otel/infra/"
+      s3_partition_format: "{year}/{month}/{day}/{hour}/"
+      file_prefix:  "infra-metrics-"
+      file_format:  parquet
+      compression:  snappy
+    marshaler: otlp_proto
+
+  # ── Debug (dev/staging only — remove in prod) ─────────────────────────────
+  debug:
+    verbosity:        detailed
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # ── Prometheus remote-write → VictoriaMetrics ────────────────────────────
+  prometheusremotewrite:
+    endpoint:         "${VICTORIA_METRICS_URL}/api/v1/write"
+    tls:
+      insecure_skip_verify: false
+    headers:
+      "X-Scope-OrgID": "infrastructure"
+    retry_on_failure:
+      enabled: true
+
+service:
+  extensions: [health_check, pprof, memory_ballast, zpages]
+
+  pipelines:
+    # ── Metrics pipeline ───────────────────────────────────────────────────
+    metrics:
+      receivers:  [otlp, prometheus, hostmetrics]
+      processors: [memory_limiter, resourcedetection, resource, attributes, filter, transform, batch]
+      exporters:  [kafka, clickhouse, prometheusremotewrite, awss3]
+
+    # ── Logs pipeline ──────────────────────────────────────────────────────
+    logs:
+      receivers:  [otlp, filelog]
+      processors: [memory_limiter, resourcedetection, resource, attributes, filter, batch]
+      exporters:  [kafka, clickhouse, awss3]
+
+    # ── Traces pipeline ────────────────────────────────────────────────────
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, resource, attributes, tail_sampling, batch]
+      exporters:  [kafka, clickhouse, awss3]
+
+  telemetry:
+    logs:
+      level:            info
+      output_paths:     ["/var/log/otel/collector.log"]
+    metrics:
+      level:            detailed
+      address:          "0.0.0.0:8888"                  # Scraped by O³ monitoring

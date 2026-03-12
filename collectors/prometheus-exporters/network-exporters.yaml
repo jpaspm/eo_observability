@@ -1,0 +1,242 @@
+# =============================================================================
+# Prometheus Exporters — Network Domain
+# Enterprise Observability Platform
+#
+# This directory contains exporter configurations for network tools that
+# expose metrics in Prometheus format, consumed by the Network OTel Collector.
+#
+# Exporters:
+#   - thousandeyes-exporter  : ThousandEyes API → Prometheus
+#   - logicmonitor-exporter  : Logic Monitor REST API → Prometheus
+#   - blackbox-exporter      : HTTP/TCP/DNS probing
+#   - snmp-exporter          : SNMP device polling
+# =============================================================================
+
+---
+# =============================================================================
+# ThousandEyes Prometheus Exporter
+# Source: https://github.com/thousandeyes/thousandeyes-prometheus-exporter
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thousandeyes-exporter
+  namespace: observability
+  labels:
+    app: thousandeyes-exporter
+    domain: network
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thousandeyes-exporter
+  template:
+    metadata:
+      labels:
+        app: thousandeyes-exporter
+        domain: network
+      annotations:
+        # Tell OTel Collector to scrape this pod
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "9090"
+        prometheus.io/path:   "/metrics"
+    spec:
+      containers:
+        - name: thousandeyes-exporter
+          image: thousandeyes/thousandeyes-prometheus-exporter:latest
+          ports:
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: TE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: thousandeyes-secrets
+                  key: api-token
+            - name: TE_ACCOUNT_GROUP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: thousandeyes-secrets
+                  key: account-group-id
+            - name: SCRAPE_INTERVAL
+              value: "60s"
+            # OTel standard labels injected into every metric
+            - name: EXTRA_LABELS
+              value: "eop_domain=network,eop_source_tool=thousandeyes,deployment_environment=${DEPLOYMENT_ENV}"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+---
+# =============================================================================
+# SNMP Exporter Configuration (snmp.yml)
+# Maps OIDs to OTel-aligned metric names
+# =============================================================================
+# This is the snmp_exporter module config — save as snmp.yml
+# OTel semantic convention names used for metric names where possible
+modules:
+  cisco_switch:
+    walk:
+      - 1.3.6.1.2.1.2                  # IF-MIB (interfaces)
+      - 1.3.6.1.2.1.31.1.1             # ifXTable (extended)
+      - 1.3.6.1.4.1.9.9.109            # Cisco CPU
+      - 1.3.6.1.4.1.9.9.48             # Cisco Memory
+
+    metrics:
+      # ── Interface metrics → OTel system.network.* ──────────────────────
+      - name: network.interface.receive.bytes
+        oid:  1.3.6.1.2.1.31.1.1.1.6   # ifHCInOctets
+        type: counter
+        help: "Total bytes received on interface"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+        lookups:
+          - labels: [network.interface.index]
+            labelname: network.interface.name
+            oid:  1.3.6.1.2.1.31.1.1.1.1  # ifName
+            type: DisplayString
+
+      - name: network.interface.transmit.bytes
+        oid:  1.3.6.1.2.1.31.1.1.1.10  # ifHCOutOctets
+        type: counter
+        help: "Total bytes transmitted on interface"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+        lookups:
+          - labels: [network.interface.index]
+            labelname: network.interface.name
+            oid:  1.3.6.1.2.1.31.1.1.1.1
+            type: DisplayString
+
+      - name: network.interface.errors.receive
+        oid:  1.3.6.1.2.1.2.2.1.14     # ifInErrors
+        type: counter
+        help: "Inbound packets with errors"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+
+      - name: network.interface.errors.transmit
+        oid:  1.3.6.1.2.1.2.2.1.20     # ifOutErrors
+        type: counter
+        help: "Outbound packets with errors"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+
+      - name: network.interface.status
+        oid:  1.3.6.1.2.1.2.2.1.8      # ifOperStatus
+        type: gauge
+        help: "Interface operational status (1=up, 2=down)"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+
+      - name: network.interface.speed
+        oid:  1.3.6.1.2.1.31.1.1.1.15  # ifHighSpeed (Mbps)
+        type: gauge
+        help: "Interface bandwidth in Mbps"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+
+      # ── CPU → OTel system.cpu.utilization ──────────────────────────────
+      - name: system.cpu.utilization
+        oid:  1.3.6.1.4.1.9.9.109.1.1.1.1.3  # cpmCPUTotal5minRev
+        type: gauge
+        help: "CPU utilization 5-minute average (Cisco)"
+        indexes:
+          - labelname: system.cpu.logical_number
+            type: gauge
+
+      # ── Memory → OTel system.memory.* ─────────────────────────────────
+      - name: system.memory.usage
+        oid:  1.3.6.1.4.1.9.9.48.1.1.1.5  # ciscoMemoryPoolUsed
+        type: gauge
+        help: "Memory in use (bytes)"
+        indexes:
+          - labelname: system.memory.pool_name
+            type: gauge
+        lookups:
+          - labels: [system.memory.pool_name]
+            labelname: system.memory.pool_name
+            oid:  1.3.6.1.4.1.9.9.48.1.1.1.2  # ciscoMemoryPoolName
+            type: DisplayString
+
+    auth:
+      community: "${SNMP_COMMUNITY}"
+    version: 2
+
+  juniper_router:
+    walk:
+      - 1.3.6.1.2.1.2
+      - 1.3.6.1.2.1.31.1.1
+      - 1.3.6.1.4.1.2636.3.1.13  # jnxOperatingBuffer
+
+    metrics:
+      - name: network.interface.receive.bytes
+        oid:  1.3.6.1.2.1.31.1.1.1.6
+        type: counter
+        help: "Total bytes received"
+        indexes:
+          - labelname: network.interface.index
+            type: gauge
+
+      - name: system.memory.utilization
+        oid:  1.3.6.1.4.1.2636.3.1.13.1.11  # jnxOperatingBuffer
+        type: gauge
+        help: "Memory buffer utilization %"
+        indexes:
+          - labelname: system.component.name
+            type: gauge
+
+    auth:
+      community: "${SNMP_COMMUNITY_JUNIPER}"
+    version: 2
+---
+# =============================================================================
+# Blackbox Exporter — HTTP/TCP/DNS probing
+# OTel-aligned metric names via relabeling in OTel Collector scrape config
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blackbox-exporter-config
+  namespace: observability
+data:
+  config.yml: |
+    modules:
+      # HTTP 2xx probe
+      http_2xx:
+        prober: http
+        timeout: 10s
+        http:
+          valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+          valid_status_codes: []                         # defaults to 2xx
+          method: GET
+          preferred_ip_protocol: "ip4"
+          ip_protocol_fallback: false
+          tls_config:
+            insecure_skip_verify: false
+
+      # TCP connectivity probe
+      tcp_connect:
+        prober: tcp
+        timeout: 5s
+        tcp:
+          preferred_ip_protocol: "ip4"
+
+      # DNS resolution probe
+      dns_lookup:
+        prober: dns
+        timeout: 5s
+        dns:
+          query_name: "${DNS_PROBE_TARGET}"
+          query_type: "A"
+          valid_rcodes:
+            - NOERROR

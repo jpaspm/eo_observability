@@ -1,0 +1,301 @@
+# =============================================================================
+# OpenTelemetry Collector — Applications Domain
+# Enterprise Observability Platform
+#
+# Receives : OTLP from app agents (AppDynamics, Dynatrace, New Relic SDK)
+#            Jaeger traces (legacy migration path)
+#            Zipkin traces (legacy migration path)
+# Processes: Trace/span normalization, W3C TraceContext, service graph
+# Exports  : OTLP → Kafka (app.traces / app.metrics / app.logs)
+#            OTLP → Tempo (trace backend)
+#            OTLP → Databricks S3 landing zone
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+  memory_ballast:
+    size_mib: 768
+
+receivers:
+  # ── OTLP from app instrumentation agents ─────────────────────────────────
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+        max_recv_msg_size_mib: 64
+      http:
+        endpoint: "0.0.0.0:4318"
+        cors:
+          allowed_origins: ["*"]                         # Restrict in prod
+
+  # ── Jaeger (legacy APM migration) ─────────────────────────────────────────
+  jaeger:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:14250"
+      thrift_http:
+        endpoint: "0.0.0.0:14268"
+      thrift_compact:
+        endpoint: "0.0.0.0:6831"
+
+  # ── Zipkin (legacy APM migration) ─────────────────────────────────────────
+  zipkin:
+    endpoint: "0.0.0.0:9411"
+
+  # ── AppDynamics via machine agent (Prometheus metrics endpoint) ───────────
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "appdynamics-machine-agent"
+          scrape_interval: 60s
+          static_configs:
+            - targets: ["${APPDYNAMICS_MACHINE_AGENT_TARGETS}"]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_appdynamics_scrape]
+              action: keep
+              regex: "true"
+          metric_relabel_configs:
+            # Normalize AppDynamics metric names to OTel conventions
+            - source_labels: [__name__]
+              regex: "appd_jvm_heap_used"
+              target_label: __name__
+              replacement: "jvm.memory.heap.used"
+            - source_labels: [__name__]
+              regex: "appd_business_transaction_calls_per_min"
+              target_label: __name__
+              replacement: "http.server.request.count"
+
+processors:
+  # ── Memory limiter ────────────────────────────────────────────────────────
+  memory_limiter:
+    check_interval: 5s
+    limit_mib:      2048
+    spike_limit_mib: 512
+
+  # ── Batch ─────────────────────────────────────────────────────────────────
+  batch:
+    send_batch_size:     2000
+    send_batch_max_size: 4000
+    timeout:             5s
+
+  # ── Resource detection ────────────────────────────────────────────────────
+  resourcedetection:
+    detectors: [env, system, docker, ec2, eks, gce, gke, azure]
+    timeout:   5s
+    override:  false
+
+  # ── Resource attribute enrichment ─────────────────────────────────────────
+  resource:
+    attributes:
+      - key:   "service.namespace"
+        value: "applications"
+        action: upsert
+      - key:   "eop.domain"
+        value: "applications"
+        action: upsert
+      - key:   "telemetry.sdk.name"
+        value: "opentelemetry"
+        action: upsert
+      # Normalize vendor-specific service name attributes
+      - key:   "service.name"
+        from_attribute: "appdynamics.application.name"
+        action: insert
+      - key:   "service.name"
+        from_attribute: "dt.entity.service"
+        action: insert
+      - key:   "service.name"
+        from_attribute: "newrelic.entity.name"
+        action: insert
+
+  # ── Span attribute normalization ──────────────────────────────────────────
+  # Vendor-specific → OTel semantic convention mapping
+  attributes:
+    actions:
+      # AppDynamics → OTel
+      - key:   "appdynamics.bt.name"
+        action: delete
+      - key:   "http.route"
+        from_attribute: "appdynamics.bt.name"
+        action: insert
+      - key:   "appdynamics.tier"
+        action: delete
+      - key:   "peer.service"
+        from_attribute: "appdynamics.tier"
+        action: insert
+
+      # Dynatrace → OTel
+      - key:   "dt.entity.process_group_instance"
+        action: delete
+      - key:   "process.pid"
+        from_attribute: "dt.entity.process_group_instance"
+        action: insert
+
+      # New Relic → OTel
+      - key:   "newrelic.source"
+        action: delete
+
+      # Normalize HTTP status codes
+      - key:    "http.status_code"
+        action:  convert
+        converted_type: int
+
+      # Ensure W3C trace context fields
+      - key:   "trace_id"
+        action: delete                                   # Remove non-standard; OTel uses built-in
+      - key:   "span_id"
+        action: delete
+
+  # ── Span metrics generation (RED metrics from traces) ─────────────────────
+  spanmetrics:
+    metrics_exporter: kafka
+    latency_histogram_buckets: [5ms, 10ms, 25ms, 50ms, 75ms, 100ms, 250ms, 500ms, 750ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - name: http.method
+        default: GET
+      - name: http.status_code
+      - name: http.route
+      - name: service.name
+      - name: deployment.environment
+    exemplars:
+      enabled: true
+    dimensions_cache_size: 10000
+    aggregation_temporality: "AGGREGATION_TEMPORALITY_CUMULATIVE"
+
+  # ── Service graph (topology mapping) ─────────────────────────────────────
+  servicegraph:
+    metrics_exporter: kafka
+    latency_histogram_buckets: [100ms, 250ms, 1s, 5s, 10s]
+    dimensions:
+      - service.namespace
+      - deployment.environment
+    store:
+      ttl: 2s
+      max_items: 200000
+
+  # ── Tail sampling (keep errors + slow traces, sample rest) ───────────────
+  tail_sampling:
+    decision_wait: 30s
+    num_traces:    50000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow-traces
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: keep-critical-services
+        type: string_attribute
+        string_attribute:
+          key:    "service.tier"
+          values: ["tier1", "tier2"]
+      - name: probabilistic-10pct
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+
+  # ── Data quality filter ───────────────────────────────────────────────────
+  filter:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["service.name"] == nil'
+        - 'attributes["deployment.environment"] == nil'
+    metrics:
+      datapoint:
+        - 'resource.attributes["service.name"] == nil'
+
+  # ── Transform — enrich spans with SLO metadata ───────────────────────────
+  transform:
+    trace_statements:
+      - context: span
+        statements:
+          # Mark error spans for SLO error budget
+          - set(attributes["slo.error_budget_impact"], true) where status.code == STATUS_CODE_ERROR
+          # Normalize HTTP method to uppercase
+          - set(attributes["http.method"], ConvertCase(attributes["http.method"], "upper")) where attributes["http.method"] != nil
+
+exporters:
+  # ── Kafka — separate topics per signal ───────────────────────────────────
+  kafka/traces:
+    brokers:          ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    protocol_version: "2.6.0"
+    topic:            "app.traces"
+    encoding:         otlp_proto
+    producer:
+      compression: zstd
+      max_message_bytes: 2000000
+
+  kafka/metrics:
+    brokers:          ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    protocol_version: "2.6.0"
+    topic:            "app.metrics"
+    encoding:         otlp_proto
+    producer:
+      compression: zstd
+
+  kafka/logs:
+    brokers:          ["${KAFKA_BOOTSTRAP_SERVERS}"]
+    protocol_version: "2.6.0"
+    topic:            "app.logs"
+    encoding:         otlp_proto
+    producer:
+      compression: zstd
+
+  # ── Grafana Tempo (trace backend) ─────────────────────────────────────────
+  otlp/tempo:
+    endpoint: "${TEMPO_ENDPOINT}"
+    tls:
+      insecure: false
+    headers:
+      "X-Scope-OrgID": "applications"
+
+  # ── S3 (Databricks landing zone) ──────────────────────────────────────────
+  awss3/traces:
+    s3_uploader:
+      region:     "${AWS_REGION}"
+      s3_bucket:  "${S3_LANDING_BUCKET}"
+      s3_prefix:  "otel/app/traces/"
+      s3_partition_format: "{year}/{month}/{day}/{hour}/"
+      file_format: parquet
+      compression: snappy
+    marshaler: otlp_proto
+
+  awss3/metrics:
+    s3_uploader:
+      region:     "${AWS_REGION}"
+      s3_bucket:  "${S3_LANDING_BUCKET}"
+      s3_prefix:  "otel/app/metrics/"
+      s3_partition_format: "{year}/{month}/{day}/{hour}/"
+      file_format: parquet
+      compression: snappy
+    marshaler: otlp_proto
+
+service:
+  extensions: [health_check, memory_ballast]
+
+  pipelines:
+    traces:
+      receivers:  [otlp, jaeger, zipkin]
+      processors: [memory_limiter, resourcedetection, resource, attributes, tail_sampling, spanmetrics, servicegraph, filter, transform, batch]
+      exporters:  [kafka/traces, otlp/tempo, awss3/traces]
+
+    metrics:
+      receivers:  [otlp, prometheus]
+      processors: [memory_limiter, resourcedetection, resource, attributes, filter, batch]
+      exporters:  [kafka/metrics, awss3/metrics]
+
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, resource, attributes, filter, batch]
+      exporters:  [kafka/logs]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level:   detailed
+      address: "0.0.0.0:8888"

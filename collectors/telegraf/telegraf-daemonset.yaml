@@ -1,0 +1,145 @@
+---
+# Telegraf DaemonSet — deploys one collector per node
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: telegraf
+  namespace: observability
+  labels:
+    app: telegraf
+    domain: infrastructure
+    otel.standard: "true"
+spec:
+  selector:
+    matchLabels:
+      app: telegraf
+  template:
+    metadata:
+      labels:
+        app: telegraf
+        domain: infrastructure
+    spec:
+      serviceAccountName: telegraf
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: telegraf
+          image: telegraf:1.30-alpine
+          env:
+            - name: SERVICE_NAME
+              value: "cloud-insights-telegraf"
+            - name: SERVICE_VERSION
+              value: "1.30.0"
+            - name: DEPLOYMENT_ENV
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOST_TYPE
+              value: "container"
+            - name: CLOUD_PROVIDER
+              value: "aws"                               # Override per environment
+            - name: CLOUD_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: telegraf-secrets
+                  key: cloud-region
+            - name: CLOUD_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: telegraf-secrets
+                  key: cloud-account-id
+            - name: TEAM_OWNER
+              value: "platform-infra"
+            - name: COST_CENTER
+              value: "CC-INFRA-001"
+            - name: OTEL_COLLECTOR_ENDPOINT
+              value: "otel-collector-infra.observability.svc.cluster.local:4317"
+            - name: VICTORIA_METRICS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: telegraf-secrets
+                  key: victoria-metrics-url
+            - name: VICTORIA_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: telegraf-secrets
+                  key: victoria-metrics-token
+            - name: K8S_CLUSTER_NAME
+              value: "prod-cluster-01"
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TELEGRAF_VERSION
+              value: "1.30.0"
+          volumeMounts:
+            - name: telegraf-config
+              mountPath: /etc/telegraf/telegraf.conf
+              subPath: telegraf.conf
+            - name: telegraf-certs
+              mountPath: /etc/telegraf/certs
+              readOnly: true
+            - name: host-proc
+              mountPath: /proc
+              readOnly: true
+            - name: host-sys
+              mountPath: /sys
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            runAsUser: 0
+            privileged: true
+      volumes:
+        - name: telegraf-config
+          configMap:
+            name: telegraf-config
+        - name: telegraf-certs
+          secret:
+            secretName: telegraf-tls
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-sys
+          hostPath:
+            path: /sys
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: telegraf
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: telegraf
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "endpoints", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: telegraf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: telegraf
+subjects:
+  - kind: ServiceAccount
+    name: telegraf
+    namespace: observability

@@ -1,0 +1,266 @@
+name: Enterprise Observability Platform — CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run catalog sync and DQ checks nightly at 02:00 UTC
+    - cron: "0 2 * * *"
+
+env:
+  PYTHON_VERSION: "3.11"
+  KUBECTL_VERSION: "1.28.0"
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════
+  # 1. Lint & Validate Collector Configs
+  # ═══════════════════════════════════════════════════════════════
+  validate-collectors:
+    name: Validate Collector Configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Telegraf config
+        uses: docker://telegraf:1.30-alpine
+        with:
+          entrypoint: telegraf
+          args: --config collectors/telegraf/telegraf.conf --test --once
+
+      - name: Install OTel Collector builder
+        run: |
+          curl -Lo otelcol-builder https://github.com/open-telemetry/opentelemetry-collector/releases/latest/download/ocb_linux_amd64
+          chmod +x otelcol-builder
+
+      - name: Validate OTel Collector configs
+        run: |
+          for config in collectors/otel-collector/**/*.yaml; do
+            echo "Validating: $config"
+            ./otelcol-builder validate --config "$config" || exit 1
+          done
+
+      - name: Validate Kubernetes manifests (Kustomize)
+        uses: azure/k8s-lint@v2.1
+        with:
+          manifests: |
+            collectors/telegraf/telegraf-daemonset.yaml
+            collectors/prometheus-exporters/network-exporters.yaml
+
+      - name: Lint YAML files
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: collectors/
+          config_data: |
+            extends: default
+            rules:
+              line-length:
+                max: 200
+              comments:
+                min-spaces-from-content: 1
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. Python Code Quality — Catalog & DQ
+  # ═══════════════════════════════════════════════════════════════
+  python-quality:
+    name: Python Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r catalog/scripts/requirements.txt
+          pip install ruff mypy pytest pytest-cov
+
+      - name: Lint with Ruff
+        run: ruff check catalog/ governance/
+
+      - name: Type check with mypy
+        run: mypy catalog/scripts/ --ignore-missing-imports
+
+      - name: Run unit tests
+        run: |
+          pytest catalog/scripts/tests/ \
+            --cov=catalog/scripts \
+            --cov-report=xml \
+            --cov-fail-under=80 \
+            -v
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. Great Expectations DQ Suite Validation (dry run)
+  # ═══════════════════════════════════════════════════════════════
+  validate-dq-suites:
+    name: Validate DQ Suites
+    runs-on: ubuntu-latest
+    needs: python-quality
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Great Expectations
+        run: pip install great_expectations==0.18.*
+
+      - name: Validate DQ suite syntax
+        run: |
+          python -c "
+          from governance.data_quality.infra_metrics_dq_suite import get_infra_metrics_suite
+          suite = get_infra_metrics_suite()
+          print(f'✓ infra_metrics_suite: {len(suite.expectations)} expectations defined')
+          "
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Deploy to Staging (on push to develop)
+  # ═══════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [validate-collectors, python-quality]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.STAGING_KUBECONFIG }}
+
+      - name: Deploy OTel Collectors to staging
+        run: |
+          kubectl apply -f collectors/otel-collector/infra/otel-collector-infra.yaml \
+            -n observability-staging
+          kubectl apply -f collectors/telegraf/telegraf-daemonset.yaml \
+            -n observability-staging
+          kubectl rollout status daemonset/telegraf -n observability-staging --timeout=120s
+
+      - name: Bootstrap catalog (dry run on staging)
+        env:
+          OM_JWT_TOKEN: ${{ secrets.STAGING_OM_JWT_TOKEN }}
+        run: |
+          pip install -r catalog/scripts/requirements.txt
+          python catalog/scripts/bootstrap_catalog.py \
+            --om-host ${{ secrets.STAGING_OM_HOST }} \
+            --domain all \
+            --dry-run
+
+  # ═══════════════════════════════════════════════════════════════
+  # 5. Deploy to Production (on push to main with approval)
+  # ═══════════════════════════════════════════════════════════════
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [validate-collectors, python-quality]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://openmetadata.internal/eop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl (production)
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.PROD_KUBECONFIG }}
+
+      - name: Deploy OTel Collectors to production
+        run: |
+          # Infra domain
+          kubectl apply -f collectors/otel-collector/infra/otel-collector-infra.yaml \
+            -n observability
+          # Apps domain
+          kubectl apply -f collectors/otel-collector/apps/otel-collector-apps.yaml \
+            -n observability
+          # Network domain
+          kubectl apply -f collectors/otel-collector/network/otel-collector-network.yaml \
+            -n observability
+          # Telegraf DaemonSet
+          kubectl apply -f collectors/telegraf/telegraf-daemonset.yaml \
+            -n observability
+          # Network exporters
+          kubectl apply -f collectors/prometheus-exporters/network-exporters.yaml \
+            -n observability
+          # Wait for rollout
+          kubectl rollout status daemonset/telegraf -n observability --timeout=300s
+
+      - name: Bootstrap OpenMetadata catalog (production)
+        env:
+          OM_JWT_TOKEN: ${{ secrets.PROD_OM_JWT_TOKEN }}
+        run: |
+          pip install -r catalog/scripts/requirements.txt
+          python catalog/scripts/bootstrap_catalog.py \
+            --om-host ${{ secrets.PROD_OM_HOST }} \
+            --domain all
+
+      - name: Notify Slack on success
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ EOP deployment to production succeeded on `${{ github.sha }}`",
+              "channel": "#platform-observability"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        if: success()
+
+      - name: Notify Slack on failure
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "❌ EOP deployment to production FAILED on `${{ github.sha }}`",
+              "channel": "#platform-observability"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        if: failure()
+
+  # ═══════════════════════════════════════════════════════════════
+  # 6. Nightly Catalog Sync & DQ Checks (scheduled)
+  # ═══════════════════════════════════════════════════════════════
+  nightly-catalog-sync:
+    name: Nightly Catalog Sync
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Sync OpenMetadata catalog
+        env:
+          OM_JWT_TOKEN: ${{ secrets.PROD_OM_JWT_TOKEN }}
+        run: |
+          pip install -r catalog/scripts/requirements.txt
+          python catalog/scripts/bootstrap_catalog.py \
+            --om-host ${{ secrets.PROD_OM_HOST }} \
+            --domain all \
+            --skip-lineage
+
+      - name: Run DQ checkpoints
+        run: |
+          pip install great_expectations==0.18.*
+          great_expectations checkpoint run infra_metrics_checkpoint
